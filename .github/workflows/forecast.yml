@@ -1,0 +1,96 @@
+name: Weather Forecast
+
+on:
+  schedule:
+    # 9 AM ET:   EST = 14:00 UTC, EDT = 13:00 UTC
+    - cron: '0 13 * * *'
+    - cron: '0 14 * * *'
+    # Noon ET:   EST = 17:00 UTC, EDT = 16:00 UTC
+    - cron: '0 16 * * *'
+    - cron: '0 17 * * *'
+
+  workflow_dispatch:
+    inputs:
+      run_type:
+        description: 'Run type'
+        required: true
+        default: 'morning'
+        type: choice
+        options:
+          - morning
+          - midday
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write    # needed to push CSVs back to the repo
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify models exist
+        run: |
+          ls data/models/*.pkl || (echo "ERROR: No trained models in data/models/. Train locally first and commit them." && exit 1)
+
+      - name: Determine run type
+        id: run_type
+        run: |
+          HOUR_UTC=$(date -u +%H)
+          if [ "$HOUR_UTC" = "13" ] || [ "$HOUR_UTC" = "14" ]; then
+            echo "type=morning" >> $GITHUB_OUTPUT
+          else
+            echo "type=midday" >> $GITHUB_OUTPUT
+          fi
+          if [ "${{ github.event.inputs.run_type }}" != "" ]; then
+            echo "type=${{ github.event.inputs.run_type }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run morning forecast (9 AM ET)
+        if: steps.run_type.outputs.type == 'morning'
+        env:
+          TOMORROW_IO_KEY:    ${{ secrets.TOMORROW_IO_KEY }}
+          WEATHER_API_KEY:    ${{ secrets.WEATHER_API_KEY }}
+          PIRATE_WEATHER_KEY: ${{ secrets.PIRATE_WEATHER_KEY }}
+          NOAA_CDO_KEY:       ${{ secrets.NOAA_CDO_KEY }}
+          EMAIL_FROM:         ${{ secrets.EMAIL_FROM }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: |
+          export PYTHONPATH=.
+          python scripts/run_morning.py
+
+      - name: Run midday forecast (Noon ET)
+        if: steps.run_type.outputs.type == 'midday'
+        env:
+          TOMORROW_IO_KEY:    ${{ secrets.TOMORROW_IO_KEY }}
+          WEATHER_API_KEY:    ${{ secrets.WEATHER_API_KEY }}
+          PIRATE_WEATHER_KEY: ${{ secrets.PIRATE_WEATHER_KEY }}
+          EMAIL_FROM:         ${{ secrets.EMAIL_FROM }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: |
+          export PYTHONPATH=.
+          python scripts/run_midday.py
+
+      - name: Commit updated data back to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data_store/predictions.csv data_store/actuals.csv data_store/run_log.csv
+          # Only commit if something actually changed
+          git diff --staged --quiet || git commit -m "data: $(date -u '+%Y-%m-%d %H:%M UTC') ${{ steps.run_type.outputs.type }} run"
+          git push

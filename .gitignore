@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+
+# Raw data pipeline outputs — too large, regenerated locally
+data/raw/
+data/processed/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# data_store/ is intentionally NOT listed here — those CSVs are committed
+# data/models/*.pkl are also committed so GitHub Actions can load them
