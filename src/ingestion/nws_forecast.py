@@ -5,12 +5,14 @@ Pulls two products per city:
   1. Daily forecast (official NWS high/low — members 1 & 2)
   2. Hourly forecast (derive max/min for the calendar day — members 3 & 4)
 
-No API key required. NWS requests a User-Agent header with contact info.
+Grid coordinates are looked up dynamically from the NWS /points/ API
+on first use and cached in memory for the run — this avoids stale
+hardcoded grids which 404 when NWS reorganizes their grid system.
 """
 
 import logging
 import asyncio
-from datetime import date, datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
 
@@ -20,29 +22,52 @@ from config.cities import CITIES
 
 logger = logging.getLogger(__name__)
 
-NWS_FORECAST_URL = "https://api.weather.gov/gridpoints/{office}/{grid}/forecast"
-NWS_HOURLY_URL   = "https://api.weather.gov/gridpoints/{office}/{grid}/forecast/hourly"
+NWS_POINTS_URL   = "https://api.weather.gov/points/{lat},{lon}"
+NWS_FORECAST_URL = "https://api.weather.gov/gridpoints/{office}/{x},{y}/forecast"
+NWS_HOURLY_URL   = "https://api.weather.gov/gridpoints/{office}/{x},{y}/forecast/hourly"
 HEADERS = {"User-Agent": "WeatherEnsemble/1.0 (contact@yourdomain.com)"}
+
+# In-memory cache: city_name -> {"office": str, "x": int, "y": int}
+_grid_cache: dict[str, dict] = {}
+
+
+async def get_grid(client: httpx.AsyncClient, city_name: str, city_cfg: dict) -> Optional[dict]:
+    """
+    Look up NWS grid office and coordinates from lat/lon via the /points/ API.
+    Caches result in memory for the duration of the run.
+    """
+    if city_name in _grid_cache:
+        return _grid_cache[city_name]
+
+    url = NWS_POINTS_URL.format(lat=city_cfg["lat"], lon=city_cfg["lon"])
+    try:
+        resp = await client.get(url, timeout=15)
+        resp.raise_for_status()
+        props = resp.json()["properties"]
+        grid = {
+            "office": props["gridId"],
+            "x":      props["gridX"],
+            "y":      props["gridY"],
+        }
+        _grid_cache[city_name] = grid
+        logger.info(f"NWS grid {city_name}: office={grid['office']} x={grid['x']} y={grid['y']}")
+        return grid
+    except Exception as e:
+        logger.error(f"NWS /points/ lookup failed for {city_name}: {e}")
+        return None
 
 
 async def fetch_nws_daily(
     client: httpx.AsyncClient, city_name: str, city_cfg: dict
 ) -> dict:
-    """
-    Fetch official NWS daily forecast and extract today's high and low.
+    """Fetch official NWS daily forecast high/low for today."""
+    result = {"city": city_name, "nws_official_high": None, "nws_official_low": None}
 
-    The daily forecast periods alternate Day/Night. We grab the first
-    'daytime' period (isDaytime=True) for the high and the following
-    night period for the low.
-    """
-    url = NWS_FORECAST_URL.format(
-        office=city_cfg["nws_office"], grid=city_cfg["nws_grid"]
-    )
-    result = {
-        "city": city_name,
-        "nws_official_high": None,
-        "nws_official_low": None,
-    }
+    grid = await get_grid(client, city_name, city_cfg)
+    if not grid:
+        return result
+
+    url = NWS_FORECAST_URL.format(**grid)
     try:
         resp = await client.get(url, timeout=15)
         resp.raise_for_status()
@@ -71,20 +96,14 @@ async def fetch_nws_daily(
 async def fetch_nws_hourly(
     client: httpx.AsyncClient, city_name: str, city_cfg: dict
 ) -> dict:
-    """
-    Fetch NWS hourly forecast and derive today's max and min temps.
+    """Fetch NWS hourly forecast and derive today's max and min temps."""
+    result = {"city": city_name, "nws_hourly_high": None, "nws_hourly_low": None}
 
-    This captures intraday resolution that the daily product averages over,
-    giving us two independent members (members 3 & 4).
-    """
-    url = NWS_HOURLY_URL.format(
-        office=city_cfg["nws_office"], grid=city_cfg["nws_grid"]
-    )
-    result = {
-        "city": city_name,
-        "nws_hourly_high": None,
-        "nws_hourly_low": None,
-    }
+    grid = await get_grid(client, city_name, city_cfg)
+    if not grid:
+        return result
+
+    url = NWS_HOURLY_URL.format(**grid)
     try:
         resp = await client.get(url, timeout=15)
         resp.raise_for_status()
@@ -103,7 +122,7 @@ async def fetch_nws_hourly(
 
         if today_temps:
             result["nws_hourly_high"] = max(today_temps)
-            result["nws_hourly_low"] = min(today_temps)
+            result["nws_hourly_low"]  = min(today_temps)
 
     except Exception as e:
         logger.error(f"NWS hourly forecast failed for {city_name}: {e}")
@@ -113,7 +132,9 @@ async def fetch_nws_hourly(
 
 
 async def fetch_city_nws(client: httpx.AsyncClient, city_name: str, city_cfg: dict) -> dict:
-    """Fetch both daily and hourly NWS products for one city and merge."""
+    """Fetch both daily and hourly NWS products for one city."""
+    # Look up grid first (shared between daily and hourly)
+    await get_grid(client, city_name, city_cfg)
     daily, hourly = await asyncio.gather(
         fetch_nws_daily(client, city_name, city_cfg),
         fetch_nws_hourly(client, city_name, city_cfg),

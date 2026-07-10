@@ -1,57 +1,74 @@
 """
 Open-Meteo ingestion — no API key required.
 
-Pulls the following forecast members per city:
-  Members 5-6:   GFS 2m temperature max/min
-  Members 7-8:   NAM 2m temperature max/min
-  Members 9-10:  HRRR 2m temperature max/min (derived from hourly)
-  Members 11-26: GEFS ensemble members 0-15 (high + low each)
-  Members 27-32: ICON-EPS ensemble members 0-5 (high + low each)
+Deterministic models (GFS, NAM, HRRR):
+  Uses api.open-meteo.com with daily=temperature_2m_max/min directly.
+  Members 5-10.
 
-Open-Meteo returns temperatures in Celsius by default.
-We convert to Fahrenheit throughout.
+Ensemble members (GEFS 0-15, ICON 0-5):
+  Uses ensemble-api.open-meteo.com with hourly=temperature_2m per member,
+  then aggregates to daily max/min in local time.
+  Members 11-32.
 """
 
 import logging
 import asyncio
-from datetime import date, datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from typing import Optional
 
 import httpx
+import pandas as pd
 
 from config.cities import CITIES
 from config.settings import GEFS_MEMBERS, ICON_MEMBERS
 
 logger = logging.getLogger(__name__)
 
-BASE_URL      = "https://api.open-meteo.com/v1/forecast"
-ENSEMBLE_URL  = "https://ensemble-api.open-meteo.com/v1/ensemble"
+BASE_URL     = "https://api.open-meteo.com/v1/forecast"
+ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
-def c_to_f(c: Optional[float]) -> Optional[float]:
-    if c is None:
-        return None
-    return round(c * 9 / 5 + 32, 2)
+
+def _daily_max_min_from_hourly(
+    hourly_times: list,
+    hourly_temps: list,
+    local_tz: ZoneInfo,
+    today: date,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Given parallel lists of ISO time strings and temperatures,
+    return (max, min) for hours falling on `today` in local_tz.
+    """
+    temps_today = []
+    for t_str, temp in zip(hourly_times, hourly_temps):
+        if temp is None:
+            continue
+        try:
+            dt = datetime.fromisoformat(t_str).replace(tzinfo=ZoneInfo("UTC")).astimezone(local_tz)
+            if dt.date() == today:
+                temps_today.append(temp)
+        except Exception:
+            continue
+    if not temps_today:
+        return None, None
+    return max(temps_today), min(temps_today)
 
 
 async def fetch_deterministic_models(
     client: httpx.AsyncClient, city_name: str, city_cfg: dict
 ) -> dict:
     """
-    Fetch GFS, NAM, and HRRR daily high/low from Open-Meteo.
-
-    Open-Meteo returns temperature_2m_max and temperature_2m_min as
-    daily aggregates when daily= is specified. We pull all three models
-    in a single request using the models= parameter.
+    Fetch GFS, NAM, HRRR daily high/low from Open-Meteo forecast API.
+    These support daily aggregates directly so no hourly→daily step needed.
     """
     params = {
-        "latitude":  city_cfg["lat"],
-        "longitude": city_cfg["lon"],
-        "daily": "temperature_2m_max,temperature_2m_min",
-        "models": "gfs_seamless,nam_conus,best_match",  # best_match includes HRRR where available
+        "latitude":         city_cfg["lat"],
+        "longitude":        city_cfg["lon"],
+        "daily":            "temperature_2m_max,temperature_2m_min",
+        "models":           "gfs_seamless,nam_conus,best_match",
         "temperature_unit": "fahrenheit",
-        "timezone": city_cfg["tz"],
-        "forecast_days": 1,
+        "timezone":         city_cfg["tz"],
+        "forecast_days":    1,
     }
 
     result = {
@@ -64,125 +81,84 @@ async def fetch_deterministic_models(
     try:
         resp = await client.get(BASE_URL, params=params, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
+        daily = resp.json().get("daily", {})
 
-        # Open-Meteo returns model-specific keys when multiple models requested
-        # Keys look like: temperature_2m_max_gfs_seamless, temperature_2m_max_nam_conus, etc.
-        daily = data.get("daily", {})
-
-        def first(vals):
+        def first(key):
+            vals = daily.get(key, [None])
             return vals[0] if vals else None
 
-        result["gfs_high"] = first(daily.get("temperature_2m_max_gfs_seamless", [None]))
-        result["gfs_low"]  = first(daily.get("temperature_2m_min_gfs_seamless", [None]))
-        result["nam_high"] = first(daily.get("temperature_2m_max_nam_conus", [None]))
-        result["nam_low"]  = first(daily.get("temperature_2m_min_nam_conus", [None]))
-        result["hrrr_high"] = first(daily.get("temperature_2m_max_best_match", [None]))
-        result["hrrr_low"]  = first(daily.get("temperature_2m_min_best_match", [None]))
+        result["gfs_high"]  = first("temperature_2m_max_gfs_seamless")
+        result["gfs_low"]   = first("temperature_2m_min_gfs_seamless")
+        result["nam_high"]  = first("temperature_2m_max_nam_conus")
+        result["nam_low"]   = first("temperature_2m_min_nam_conus")
+        result["hrrr_high"] = first("temperature_2m_max_best_match")
+        result["hrrr_low"]  = first("temperature_2m_min_best_match")
 
     except Exception as e:
-        logger.error(f"Open-Meteo deterministic fetch failed for {city_name}: {e}")
+        logger.error(f"Open-Meteo deterministic failed for {city_name}: {e}")
 
-    logger.info(f"Open-Meteo det {city_name}: GFS={result['gfs_high']}/{result['gfs_low']} "
-                f"NAM={result['nam_high']}/{result['nam_low']} HRRR={result['hrrr_high']}/{result['hrrr_low']}")
+    logger.info(
+        f"Open-Meteo det {city_name}: "
+        f"GFS={result['gfs_high']}/{result['gfs_low']} "
+        f"NAM={result['nam_high']}/{result['nam_low']} "
+        f"HRRR={result['hrrr_high']}/{result['hrrr_low']}"
+    )
     return result
 
 
-async def fetch_gefs_members(
-    client: httpx.AsyncClient, city_name: str, city_cfg: dict
+async def fetch_ensemble_members(
+    client: httpx.AsyncClient,
+    city_name: str,
+    city_cfg: dict,
+    model: str,
+    members: list[int],
+    prefix: str,
 ) -> dict:
     """
-    Fetch GEFS ensemble members 0-15 from Open-Meteo ensemble API.
+    Fetch hourly temperature for each ensemble member and aggregate to daily high/low.
 
-    Each member is a perturbed-initial-condition forecast from NOAA's
-    Global Ensemble Forecast System. 16 members × (high + low) = 32 values.
+    The ensemble API only supports hourly output — we request all members
+    in one call (one variable per member) then aggregate in local time.
     """
-    member_vars = []
-    for m in GEFS_MEMBERS:
-        member_vars.append(f"temperature_2m_max_member{m:02d}")
-        member_vars.append(f"temperature_2m_min_member{m:02d}")
+    local_tz = ZoneInfo(city_cfg["tz"])
+    today    = datetime.now(local_tz).date()
+
+    # Build variable list: temperature_2m_member00, temperature_2m_member01, ...
+    member_vars = [f"temperature_2m_member{m:02d}" for m in members]
 
     params = {
-        "latitude":  city_cfg["lat"],
-        "longitude": city_cfg["lon"],
-        "daily": ",".join(member_vars),
-        "models": "gfs_seamless",
+        "latitude":         city_cfg["lat"],
+        "longitude":        city_cfg["lon"],
+        "hourly":           ",".join(member_vars),
+        "models":           model,
         "temperature_unit": "fahrenheit",
-        "timezone": city_cfg["tz"],
-        "forecast_days": 1,
+        "timezone":         "UTC",   # always UTC from ensemble API; we convert manually
+        "forecast_days":    2,       # 2 days to ensure we capture full local day
     }
 
     result = {"city": city_name}
+    for m in members:
+        result[f"{prefix}_m{m:02d}_high"] = None
+        result[f"{prefix}_m{m:02d}_low"]  = None
 
     try:
-        resp = await client.get(ENSEMBLE_URL, params=params, timeout=20)
+        resp = await client.get(ENSEMBLE_URL, params=params, timeout=30)
         resp.raise_for_status()
-        daily = resp.json().get("daily", {})
+        hourly = resp.json().get("hourly", {})
+        times  = hourly.get("time", [])
 
-        for m in GEFS_MEMBERS:
-            high_key = f"temperature_2m_max_member{m:02d}"
-            low_key  = f"temperature_2m_min_member{m:02d}"
-            vals_high = daily.get(high_key, [None])
-            vals_low  = daily.get(low_key,  [None])
-            result[f"gefs_m{m:02d}_high"] = vals_high[0] if vals_high else None
-            result[f"gefs_m{m:02d}_low"]  = vals_low[0]  if vals_low  else None
+        for m in members:
+            var   = f"temperature_2m_member{m:02d}"
+            temps = hourly.get(var, [])
+            high, low = _daily_max_min_from_hourly(times, temps, local_tz, today)
+            result[f"{prefix}_m{m:02d}_high"] = high
+            result[f"{prefix}_m{m:02d}_low"]  = low
 
     except Exception as e:
-        logger.error(f"GEFS ensemble fetch failed for {city_name}: {e}")
-        for m in GEFS_MEMBERS:
-            result[f"gefs_m{m:02d}_high"] = None
-            result[f"gefs_m{m:02d}_low"]  = None
+        logger.error(f"{model} ensemble failed for {city_name}: {e}")
 
-    logger.info(f"GEFS {city_name}: fetched {len(GEFS_MEMBERS)} members")
-    return result
-
-
-async def fetch_icon_members(
-    client: httpx.AsyncClient, city_name: str, city_cfg: dict
-) -> dict:
-    """
-    Fetch ICON-EPS ensemble members 0-5 from Open-Meteo.
-
-    ICON-EPS is DWD Germany's ensemble — independent model, different
-    physics parameterizations than GFS, adds genuine diversity.
-    """
-    member_vars = []
-    for m in ICON_MEMBERS:
-        member_vars.append(f"temperature_2m_max_member{m:02d}")
-        member_vars.append(f"temperature_2m_min_member{m:02d}")
-
-    params = {
-        "latitude":  city_cfg["lat"],
-        "longitude": city_cfg["lon"],
-        "daily": ",".join(member_vars),
-        "models": "icon_seamless",
-        "temperature_unit": "fahrenheit",
-        "timezone": city_cfg["tz"],
-        "forecast_days": 1,
-    }
-
-    result = {"city": city_name}
-
-    try:
-        resp = await client.get(ENSEMBLE_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        daily = resp.json().get("daily", {})
-
-        for m in ICON_MEMBERS:
-            high_key = f"temperature_2m_max_member{m:02d}"
-            low_key  = f"temperature_2m_min_member{m:02d}"
-            vals_high = daily.get(high_key, [None])
-            vals_low  = daily.get(low_key,  [None])
-            result[f"icon_m{m:02d}_high"] = vals_high[0] if vals_high else None
-            result[f"icon_m{m:02d}_low"]  = vals_low[0]  if vals_low  else None
-
-    except Exception as e:
-        logger.error(f"ICON ensemble fetch failed for {city_name}: {e}")
-        for m in ICON_MEMBERS:
-            result[f"icon_m{m:02d}_high"] = None
-            result[f"icon_m{m:02d}_low"]  = None
-
-    logger.info(f"ICON {city_name}: fetched {len(ICON_MEMBERS)} members")
+    n_ok = sum(1 for m in members if result[f"{prefix}_m{m:02d}_high"] is not None)
+    logger.info(f"{model} {city_name}: {n_ok}/{len(members)} members retrieved")
     return result
 
 
@@ -192,11 +168,13 @@ async def fetch_city_open_meteo(
     city_name: str,
     city_cfg: dict,
 ) -> dict:
-    """Fetch all Open-Meteo products for one city and merge into one dict."""
+    """Fetch all Open-Meteo products for one city concurrently."""
     det, gefs, icon = await asyncio.gather(
         fetch_deterministic_models(client_det, city_name, city_cfg),
-        fetch_gefs_members(client_ens, city_name, city_cfg),
-        fetch_icon_members(client_ens, city_name, city_cfg),
+        fetch_ensemble_members(client_ens, city_name, city_cfg,
+                               model="gfs_seamless", members=GEFS_MEMBERS, prefix="gefs"),
+        fetch_ensemble_members(client_ens, city_name, city_cfg,
+                               model="icon_seamless", members=ICON_MEMBERS, prefix="icon"),
     )
     return {**det, **gefs, **icon}
 
@@ -219,4 +197,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     results = asyncio.run(fetch_all_open_meteo())
     for r in results:
-        print({k: v for k, v in r.items() if "high" in k or "low" in k or k == "city"})
+        print(
+            f"{r['city']:20s}  "
+            f"GFS={r.get('gfs_high')}/{r.get('gfs_low')}  "
+            f"GEFS_m00={r.get('gefs_m00_high')}/{r.get('gefs_m00_low')}  "
+            f"ICON_m00={r.get('icon_m00_high')}/{r.get('icon_m00_low')}"
+        )
