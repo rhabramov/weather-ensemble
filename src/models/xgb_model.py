@@ -234,6 +234,19 @@ def predict(
         if X[col].isna().any():
             X[col] = X[col].fillna(X[col].median())
 
+    # Align feature columns to match what the model was trained on
+    expected_features = model_high.get_booster().feature_names
+
+    # Add missing columns as NaN
+    for col in expected_features:
+        if col not in X.columns:
+            logger.warning("Missing feature column: %s — filling with NaN", col)
+            X[col] = np.nan
+
+    # Drop extra columns, reorder to match training
+    X = X[expected_features]
+    X = X.astype({col: "float64" for col in X.columns if X[col].dtype == object})
+
     preds = df[["city", "forecast_date"]].copy()
     preds["pred_high"] = np.round(model_high.predict(X), 1)
     preds["pred_low"]  = np.round(model_low.predict(X), 1)

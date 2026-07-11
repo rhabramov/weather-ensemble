@@ -32,8 +32,8 @@ async def main():
     feature_df = await build_feature_matrix(target_date=date.today())
 
     logger.info("Running inference...")
-    model_high, model_low, city_encoder = load_models()
-    preds_df = predict(feature_df, model_high, model_low, city_encoder)
+    model_high, model_low, city_encoder, corrector = load_models()
+    preds_df = predict(feature_df, model_high, model_low, city_encoder, corrector)
     save_predictions(preds_df, run_type="midday")
 
     logger.info("Sending noon update email...")

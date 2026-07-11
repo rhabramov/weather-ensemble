@@ -45,8 +45,8 @@ async def main():
 
     # Step 3: Inference
     logger.info("Running inference...")
-    model_high, model_low, city_encoder = load_models()
-    preds_df = predict(feature_df, model_high, model_low, city_encoder)
+    model_high, model_low, city_encoder, corrector = load_models()
+    preds_df = predict(feature_df, model_high, model_low, city_encoder, corrector)
     save_predictions(preds_df, run_type="morning")
 
     # Step 4: Email
