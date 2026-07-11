@@ -54,23 +54,15 @@ def _daily_max_min_from_hourly(
     return max(temps_today), min(temps_today)
 
 
-async def fetch_deterministic_models(
-    client: httpx.AsyncClient, city_name: str, city_cfg: dict
-) -> dict:
-    """
-    Fetch GFS, NAM, HRRR daily high/low from Open-Meteo forecast API.
-    These support daily aggregates directly so no hourly→daily step needed.
-    """
-    params = {
-        "latitude":         city_cfg["lat"],
-        "longitude":        city_cfg["lon"],
-        "daily":            "temperature_2m_max,temperature_2m_min",
-        "models":           "gfs_seamless,nam_conus,best_match",
-        "temperature_unit": "fahrenheit",
-        "timezone":         city_cfg["tz"],
-        "forecast_days":    1,
-    }
+DETERMINISTIC_MODELS = {
+    "gfs":  "gfs_seamless",
+    "hrrr": "best_match",
+}
 
+async def fetch_deterministic_models(
+    client: httpx.AsyncClient, city_name: str, city_cfg: dict,
+    sem: asyncio.Semaphore,
+) -> dict:
     result = {
         "city": city_name,
         "gfs_high": None, "gfs_low": None,
@@ -78,30 +70,33 @@ async def fetch_deterministic_models(
         "hrrr_high": None, "hrrr_low": None,
     }
 
-    try:
-        resp = await client.get(BASE_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        daily = resp.json().get("daily", {})
+    async def fetch_one(prefix: str, model: str):
+        params = {
+            "latitude":         city_cfg["lat"],
+            "longitude":        city_cfg["lon"],
+            "daily":            "temperature_2m_max,temperature_2m_min",
+            "models":           model,
+            "temperature_unit": "fahrenheit",
+            "timezone":         city_cfg["tz"],
+            "forecast_days":    1,
+        }
+        try:
+            async with sem:
+                resp = await client.get(BASE_URL, params=params, timeout=20)
+            resp.raise_for_status()
+            daily = resp.json().get("daily", {})
+            result[f"{prefix}_high"] = (daily.get("temperature_2m_max") or [None])[0]
+            result[f"{prefix}_low"]  = (daily.get("temperature_2m_min") or [None])[0]
+        except Exception as e:
+            logger.error("Open-Meteo %s failed for %s: %s", model, city_name, e)
 
-        def first(key):
-            vals = daily.get(key, [None])
-            return vals[0] if vals else None
-
-        result["gfs_high"]  = first("temperature_2m_max_gfs_seamless")
-        result["gfs_low"]   = first("temperature_2m_min_gfs_seamless")
-        result["nam_high"]  = first("temperature_2m_max_nam_conus")
-        result["nam_low"]   = first("temperature_2m_min_nam_conus")
-        result["hrrr_high"] = first("temperature_2m_max_best_match")
-        result["hrrr_low"]  = first("temperature_2m_min_best_match")
-
-    except Exception as e:
-        logger.error(f"Open-Meteo deterministic failed for {city_name}: {e}")
-
+    await asyncio.gather(*[fetch_one(p, m) for p, m in DETERMINISTIC_MODELS.items()])
     logger.info(
-        f"Open-Meteo det {city_name}: "
-        f"GFS={result['gfs_high']}/{result['gfs_low']} "
-        f"NAM={result['nam_high']}/{result['nam_low']} "
-        f"HRRR={result['hrrr_high']}/{result['hrrr_low']}"
+        "Open-Meteo det %s: GFS=%s/%s NAM=%s/%s HRRR=%s/%s",
+        city_name,
+        result["gfs_high"], result["gfs_low"],
+        result["nam_high"], result["nam_low"],
+        result["hrrr_high"], result["hrrr_low"],
     )
     return result
 
@@ -114,26 +109,17 @@ async def fetch_ensemble_members(
     members: list[int],
     prefix: str,
 ) -> dict:
-    """
-    Fetch hourly temperature for each ensemble member and aggregate to daily high/low.
-
-    The ensemble API only supports hourly output — we request all members
-    in one call (one variable per member) then aggregate in local time.
-    """
     local_tz = ZoneInfo(city_cfg["tz"])
     today    = datetime.now(local_tz).date()
-
-    # Build variable list: temperature_2m_member00, temperature_2m_member01, ...
-    member_vars = [f"temperature_2m_member{m:02d}" for m in members]
 
     params = {
         "latitude":         city_cfg["lat"],
         "longitude":        city_cfg["lon"],
-        "hourly":           ",".join(member_vars),
+        "hourly":           "temperature_2m",   # <-- just this; API returns member00, member01, etc.
         "models":           model,
         "temperature_unit": "fahrenheit",
-        "timezone":         "UTC",   # always UTC from ensemble API; we convert manually
-        "forecast_days":    2,       # 2 days to ensure we capture full local day
+        "timezone":         "UTC",
+        "forecast_days":    2,
     }
 
     result = {"city": city_name}
@@ -168,7 +154,6 @@ async def fetch_city_open_meteo(
     city_name: str,
     city_cfg: dict,
 ) -> dict:
-    """Fetch all Open-Meteo products for one city concurrently."""
     det, gefs, icon = await asyncio.gather(
         fetch_deterministic_models(client_det, city_name, city_cfg),
         fetch_ensemble_members(client_ens, city_name, city_cfg,
@@ -179,14 +164,34 @@ async def fetch_city_open_meteo(
     return {**det, **gefs, **icon}
 
 
+ENSEMBLE_CONCURRENCY = 4  # tune down if still hitting 429
+DET_CONCURRENCY = 4  # tune down if still hitting 429
+
 async def fetch_all_open_meteo() -> list[dict]:
-    """Fetch all Open-Meteo data for all 20 cities concurrently."""
+    ens_sem = asyncio.Semaphore(ENSEMBLE_CONCURRENCY)
+    det_sem = asyncio.Semaphore(DET_CONCURRENCY)
+
+    async def fetch_city(client_det, client_ens, city_name, city_cfg):
+        det = await fetch_deterministic_models(client_det, city_name, city_cfg, det_sem)
+        
+        async def guarded_ensemble(*args, **kwargs):
+            async with ens_sem:
+                return await fetch_ensemble_members(*args, **kwargs)
+
+        gefs, icon = await asyncio.gather(
+            guarded_ensemble(client_ens, city_name, city_cfg,
+                             model="gfs_seamless", members=GEFS_MEMBERS, prefix="gefs"),
+            guarded_ensemble(client_ens, city_name, city_cfg,
+                             model="icon_seamless", members=ICON_MEMBERS, prefix="icon"),
+        )
+        return {**det, **gefs, **icon}
+
     async with (
         httpx.AsyncClient() as client_det,
         httpx.AsyncClient() as client_ens,
     ):
         tasks = [
-            fetch_city_open_meteo(client_det, client_ens, city_name, city_cfg)
+            fetch_city(client_det, client_ens, city_name, city_cfg)
             for city_name, city_cfg in CITIES.items()
         ]
         results = await asyncio.gather(*tasks)
@@ -197,6 +202,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     results = asyncio.run(fetch_all_open_meteo())
     for r in results:
+        ens_keys = [k for k in r if 'gefs' in k or 'icon' in k]
+        print(f"{r['city']}: ensemble keys = {ens_keys[:4]}")
         print(
             f"{r['city']:20s}  "
             f"GFS={r.get('gfs_high')}/{r.get('gfs_low')}  "
