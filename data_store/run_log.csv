@@ -52,3 +52,4 @@ run_time,run_type,status,n_cities,duration_s,notes
 2026-07-25T16:42:17.611156+00:00,midday,success,20,34.5,
 2026-07-25T17:58:46.728877+00:00,midday,success,20,34.8,
 2026-07-26T14:28:25.746018+00:00,morning,success,20,34.3,
+2026-07-26T14:58:49.760496+00:00,morning,success,20,180.4,
