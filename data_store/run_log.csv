@@ -90,3 +90,4 @@ run_time,run_type,status,n_cities,duration_s,notes
 2026-08-04T17:27:02.983497+00:00,midday,success,20,34.0,
 2026-08-04T18:27:22.488736+00:00,midday,success,20,33.2,
 2026-08-05T15:12:42.902216+00:00,midday,success,20,34.2,
+2026-08-05T15:56:04.442362+00:00,midday,success,20,190.3,
